@@ -1,37 +1,44 @@
-from .cffi import request
-from .cookies import cookiejar_from_dict, get_cookie_header, merge_cookies, extract_cookies_to_jar
+from .cffi import request, freeMemory, destroySession
+from .cookies import cookiejar_from_dict, merge_cookies, extract_cookies_to_jar
 from .exceptions import TLSClientExeption
-from .response import build_response
+from .response import build_response, Response
+from .settings import ClientIdentifiers
 from .structures import CaseInsensitiveDict
 from .__version__ import __version__
 
-from typing import Any, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from json import dumps, loads
 import urllib.parse
 import base64
 import ctypes
 import uuid
+import urllib3
 
 
 class Session:
 
     def __init__(
         self,
-        client_identifier: Optional[str] = None,
+        client_identifier: ClientIdentifiers = "chrome_120",
         ja3_string: Optional[str] = None,
-        h2_settings: Optional[dict] = None,  # Optional[dict[str, int]]
-        h2_settings_order: Optional[list] = None,  # Optional[list[str]]
-        supported_signature_algorithms: Optional[list] = None,  # Optional[list[str]]
-        supported_versions: Optional[list] = None,  # Optional[list[str]]
-        key_share_curves: Optional[list] = None,  # Optional[list[str]]
+        h2_settings: Optional[Dict[str, int]] = None,
+        h2_settings_order: Optional[List[str]] = None,
+        supported_signature_algorithms: Optional[List[str]] = None,
+        supported_delegated_credentials_algorithms: Optional[List[str]] = None,
+        supported_versions: Optional[List[str]] = None,
+        key_share_curves: Optional[List[str]] = None,
         cert_compression_algo: str = None,
-        pseudo_header_order: Optional[list] = None,  # Optional[list[str]
+        additional_decode: str = None,
+        pseudo_header_order: Optional[List[str]] = None,
         connection_flow: Optional[int] = None,
         priority_frames: Optional[list] = None,
-        header_order: Optional[list] = None,  # Optional[list[str]]
-        header_priority: Optional[dict] = None,  # Optional[list[str]]
+        header_order: Optional[List[str]] = None,
+        header_priority: Optional[List[str]] = None,
         random_tls_extension_order: Optional = False,
         force_http1: Optional = False,
+        catch_panics: Optional = False,
+        debug: Optional = False,
+        certificate_pinning: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self._session_id = str(uuid.uuid4())
         # --- Standard Settings ----------------------------------------------------------------------------------------
@@ -60,6 +67,12 @@ class Session:
         # CookieJar containing all currently outstanding cookies set on this session
         self.cookies = cookiejar_from_dict({})
 
+        # Timeout
+        self.timeout_seconds = 30
+
+        # Certificate pinning
+        self.certificate_pinning = certificate_pinning
+
         # --- Advanced Settings ----------------------------------------------------------------------------------------
 
         # Examples:
@@ -69,6 +82,8 @@ class Session:
         # Safari --> safari_15_3, safari_15_6_1, safari_16_0
         # iOS --> safari_ios_15_5, safari_ios_15_6, safari_ios_16_0
         # iPadOS --> safari_ios_15_6
+        #
+        # for all possible client identifiers, check out the settings.py
         self.client_identifier = client_identifier
 
         # Set JA3 --> TLSVersion, Ciphers, Extensions, EllipticCurves, EllipticCurvePointFormats
@@ -131,6 +146,33 @@ class Session:
         # ]
         self.supported_signature_algorithms = supported_signature_algorithms
 
+        # Supported Delegated Credentials Algorithms
+        # Possible Settings:
+        # PKCS1WithSHA256
+        # PKCS1WithSHA384
+        # PKCS1WithSHA512
+        # PSSWithSHA256
+        # PSSWithSHA384
+        # PSSWithSHA512
+        # ECDSAWithP256AndSHA256
+        # ECDSAWithP384AndSHA384
+        # ECDSAWithP521AndSHA512
+        # PKCS1WithSHA1
+        # ECDSAWithSHA1
+        #
+        # Example:
+        # [
+        #     "ECDSAWithP256AndSHA256",
+        #     "PSSWithSHA256",
+        #     "PKCS1WithSHA256",
+        #     "ECDSAWithP384AndSHA384",
+        #     "PSSWithSHA384",
+        #     "PKCS1WithSHA384",
+        #     "PSSWithSHA512",
+        #     "PKCS1WithSHA512",
+        # ]
+        self.supported_delegated_credentials_algorithms = supported_delegated_credentials_algorithms
+
         # Supported Versions
         # Possible Settings:
         # GREASE
@@ -165,6 +207,11 @@ class Session:
         # Cert Compression Algorithm
         # Examples: "zlib", "brotli", "zstd"
         self.cert_compression_algo = cert_compression_algo
+
+        # Additional Decode
+        # Make sure the go code decodes the response body once explicit by provided algorithm.
+        # Examples: null, "gzip", "br", "deflate"
+        self.additional_decode = additional_decode
 
         # Pseudo Header Order (:authority, :method, :path, :scheme)
         # Example:
@@ -225,6 +272,36 @@ class Session:
         # force HTTP1
         self.force_http1 = force_http1
 
+        # catch panics
+        # avoid the tls client to print the whole stacktrace when a panic (critical go error) happens
+        self.catch_panics = catch_panics
+
+        # debugging
+        self.debug = debug
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self) -> str:
+        destroy_session_payload = {
+            "sessionId": self._session_id
+        }
+
+        destroy_session_response = destroySession(dumps(destroy_session_payload).encode('utf-8'))
+        # we dereference the pointer to a byte array
+        destroy_session_response_bytes = ctypes.string_at(destroy_session_response)
+        # convert our byte array to a string (tls client returns json)
+        destroy_session_response_string = destroy_session_response_bytes.decode('utf-8')
+        # convert response string to json
+        destroy_session_response_object = loads(destroy_session_response_string)
+
+        freeMemory(destroy_session_response_object['id'].encode('utf-8'))
+
+        return destroy_session_response_string
+
     def execute_request(
         self,
         method: str,
@@ -234,15 +311,19 @@ class Session:
         headers: Optional[dict] = None,  # Optional[dict[str, str]]
         cookies: Optional[dict] = None,  # Optional[dict[str, str]]
         json: Optional[dict] = None,  # Optional[dict]
-        allow_redirects: Optional[bool] = False,
+        files = None,
+        allow_redirects: Optional[bool] = True,
         insecure_skip_verify: Optional[bool] = False,
-        timeout_seconds: Optional[int] = 30,
+        timeout_seconds: Optional[int] = None,
         proxy: Optional[dict] = None  # Optional[dict[str, str]]
-    ):
+    ) -> Response:
         # --- URL ------------------------------------------------------------------------------------------------------
         # Prepare URL - add params to url
         if params is not None:
             url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
+
+        if headers is None:
+            headers = {}
 
         # --- Request Body ---------------------------------------------------------------------------------------------
         # Prepare request body - build request body
@@ -252,6 +333,8 @@ class Session:
                 json = dumps(json)
             request_body = json
             content_type = "application/json"
+        elif data is None and files is not None:
+            request_body, content_type = urllib3.encode_multipart_formdata(files)
         elif data is not None and type(data) not in [str, bytes]:
             request_body = urllib.parse.urlencode(data, doseq=True)
             content_type = "application/x-www-form-urlencoded"
@@ -259,32 +342,35 @@ class Session:
             request_body = data
             content_type = None
         # set content type if it isn't set
-        if content_type is not None and "content-type" not in self.headers:
-            self.headers["Content-Type"] = content_type
+        if content_type is not None and "content-type" not in self.headers and "content-type" not in headers:
+            headers["Content-Type"] = content_type
 
         # --- Headers --------------------------------------------------------------------------------------------------
-        # merge headers of session and of the request
-        if headers is not None:
-            for header_key, header_value in headers.items():
-                # check if all header keys and values are strings
-                if type(header_key) is str and type(header_value) is str:
-                    self.headers[header_key] = header_value
-                headers = self.headers
-        else:
+        if self.headers is None:
+            headers = CaseInsensitiveDict(headers)
+        elif headers is None:
             headers = self.headers
+        else:
+            merged_headers = CaseInsensitiveDict(self.headers)
+            merged_headers.update(headers)
+
+            # Remove items, where the key or value is set to None.
+            none_keys = [k for (k, v) in merged_headers.items() if v is None or k is None]
+            for key in none_keys:
+                del merged_headers[key]
+
+            headers = merged_headers
 
         # --- Cookies --------------------------------------------------------------------------------------------------
         cookies = cookies or {}
         # Merge with session cookies
         cookies = merge_cookies(self.cookies, cookies)
-
-        cookie_header = get_cookie_header(
-            request_url=url,
-            request_headers=headers,
-            cookie_jar=cookies
-        )
-        if cookie_header is not None:
-            headers["Cookie"] = cookie_header
+        # turn cookie jar into dict
+        # in the cookie value the " gets removed, because the fhttp library in golang doesn't accept the character
+        request_cookies = [
+            {'domain': c.domain, 'expires': c.expires, 'name': c.name, 'path': c.path, 'value': c.value.replace('"', "")}
+            for c in cookies
+        ]
 
         # --- Proxy ----------------------------------------------------------------------------------------------------
         proxy = proxy or self.proxies
@@ -296,23 +382,39 @@ class Session:
         else:
             proxy = ""
 
+        # --- Timeout --------------------------------------------------------------------------------------------------
+        # maximum time to wait for a response
+
+        timeout_seconds = timeout_seconds or self.timeout_seconds
+
+        # --- Certificate pinning --------------------------------------------------------------------------------------
+        # pins a certificate so that it restricts which certificates are considered valid
+
+        certificate_pinning = self.certificate_pinning
+        
         # --- Request --------------------------------------------------------------------------------------------------
         is_byte_request = isinstance(request_body, (bytes, bytearray))
         request_payload = {
             "sessionId": self._session_id,
             "followRedirects": allow_redirects,
             "forceHttp1": self.force_http1,
+            "withDebug": self.debug,
+            "catchPanics": self.catch_panics,
             "headers": dict(headers),
             "headerOrder": self.header_order,
             "insecureSkipVerify": insecure_skip_verify,
             "isByteRequest": is_byte_request,
+            "isByteResponse": True,
+            "additionalDecode": self.additional_decode,
             "proxyUrl": proxy,
             "requestUrl": url,
             "requestMethod": method,
             "requestBody": base64.b64encode(request_body).decode() if is_byte_request else request_body,
-            "requestCookies": [],  # Empty because it's handled in python
+            "requestCookies": request_cookies,
             "timeoutSeconds": timeout_seconds,
         }
+        if certificate_pinning:
+            request_payload["certificatePinningHosts"] = certificate_pinning
         if self.client_identifier is None:
             request_payload["customTlsClient"] = {
                 "ja3String": self.ja3_string,
@@ -325,6 +427,7 @@ class Session:
                 "certCompressionAlgo": self.cert_compression_algo,
                 "supportedVersions": self.supported_versions,
                 "supportedSignatureAlgorithms": self.supported_signature_algorithms,
+                "supportedDelegatedCredentialsAlgorithms": self.supported_delegated_credentials_algorithms ,
                 "keyShareCurves": self.key_share_curves,
             }
         else:
@@ -339,7 +442,8 @@ class Session:
         response_string = response_bytes.decode('utf-8')
         # convert response string to json
         response_object = loads(response_string)
-
+        # free the memory
+        freeMemory(response_object['id'].encode('utf-8'))
         # --- Response -------------------------------------------------------------------------------------------------
         # Error handling
         if response_object["status"] == 0:
@@ -358,7 +462,7 @@ class Session:
         self,
         url: str,
         **kwargs: Any
-    ):
+    ) -> Response:
         """Sends a GET request"""
         return self.execute_request(method="GET", url=url, **kwargs)
 
@@ -366,7 +470,7 @@ class Session:
         self,
         url: str,
         **kwargs: Any
-    ):
+    ) -> Response:
         """Sends a OPTIONS request"""
         return self.execute_request(method="OPTIONS", url=url, **kwargs)
 
@@ -374,7 +478,7 @@ class Session:
         self,
         url: str,
         **kwargs: Any
-    ):
+    ) -> Response:
         """Sends a HEAD request"""
         return self.execute_request(method="HEAD", url=url, **kwargs)
 
@@ -384,7 +488,7 @@ class Session:
         data: Optional[Union[str, dict]] = None,
         json: Optional[dict] = None,
         **kwargs: Any
-    ):
+    ) -> Response:
         """Sends a POST request"""
         return self.execute_request(method="POST", url=url, data=data, json=json, **kwargs)
 
@@ -394,7 +498,7 @@ class Session:
         data: Optional[Union[str, dict]] = None,
         json: Optional[dict] = None,
         **kwargs: Any
-    ):
+    ) -> Response:
         """Sends a PUT request"""
         return self.execute_request(method="PUT", url=url, data=data, json=json, **kwargs)
 
@@ -404,14 +508,14 @@ class Session:
         data: Optional[Union[str, dict]] = None,
         json: Optional[dict] = None,
         **kwargs: Any
-    ):
-        """Sends a PUT request"""
+    ) -> Response:
+        """Sends a PATCH request"""
         return self.execute_request(method="PATCH", url=url, data=data, json=json, **kwargs)
 
     def delete(
         self,
         url: str,
         **kwargs: Any
-    ):
+    ) -> Response:
         """Sends a DELETE request"""
         return self.execute_request(method="DELETE", url=url, **kwargs)

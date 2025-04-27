@@ -1,9 +1,9 @@
 from .cookies import cookiejar_from_dict, RequestsCookieJar
 from .structures import CaseInsensitiveDict
 
-from http.cookiejar import CookieJar
 from typing import Union
 import json
+import base64
 
 
 class Response:
@@ -26,6 +26,8 @@ class Response:
         # A CookieJar of Cookies the server sent back.
         self.cookies = cookiejar_from_dict({})
 
+        self._content = False
+
     def __enter__(self):
         return self
 
@@ -35,6 +37,21 @@ class Response:
     def json(self, **kwargs):
         """parse response body to json (dict/list)"""
         return json.loads(self.text, **kwargs)
+
+    @property
+    def content(self):
+        """Content of the response, in bytes."""
+
+        if self._content is False:
+            if self._content_consumed:
+                raise RuntimeError("The content for this response was already consumed")
+
+            if self.status_code == 0:
+                self._content = None
+            else:
+                self._content = b"".join(self.iter_content(10 * 1024)) or b""
+        self._content_consumed = True
+        return self._content
 
 
 def build_response(res: Union[dict, list], res_cookies: RequestsCookieJar) -> Response:
@@ -56,5 +73,7 @@ def build_response(res: Union[dict, list], res_cookies: RequestsCookieJar) -> Re
     # Add cookies
     response.cookies = res_cookies
     # Add response body
-    response.text = res["body"]
+    response.text = base64.b64decode(res["body"].split(',')[1]).decode(errors='ignore')
+    # Add response content (bytes)
+    response._content = base64.b64decode(res["body"].split(',')[1])
     return response
